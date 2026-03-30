@@ -1,0 +1,155 @@
+name: Wiki — Incremento automático (Gemini)
+
+on:
+  push:
+    branches: [main, develop, homolog]
+    paths:
+      - 'app/Http/Controllers/**/*.php'
+      - 'app/Models/Tenant/**/*.php'
+      - 'app/Models/Padrao/**/*.php'
+      - 'app/Jobs/Tenant/**/*.php'
+      - 'app/Traits/**/*.php'
+      - 'resources/js/pages/**/*.vue'
+      - 'resources/js/service/tenant/**/*.js'
+      - 'database/migrations/**/*.php'
+  workflow_dispatch:
+    inputs:
+      file:
+        description: 'Arquivo específico (ex: app/Http/Controllers/Permits/DocumentoCtrl.php)'
+        required: false
+      force_all:
+        description: 'Regera todos os docs (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  update-wiki:
+    name: Atualizar wiki via Gemini
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (com histórico para git diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Detectar arquivos alterados
+        id: changed
+        run: |
+          if [ -n "${{ github.event.inputs.file }}" ]; then
+            echo "files=${{ github.event.inputs.file }}" >> $GITHUB_OUTPUT
+            echo "mode=single" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.inputs.force_all }}" = "true" ]; then
+            echo "mode=all" >> $GITHUB_OUTPUT
+          else
+            FILES=$(git diff --name-only HEAD~1 HEAD | \
+              grep -E '\.(php|vue|js)$' | \
+              grep -vE '(vendor/|node_modules/|\.test\.|\.spec\.|\.min\.)' | \
+              tr '\n' ',' | sed 's/,$//')
+            echo "files=$FILES" >> $GITHUB_OUTPUT
+            echo "mode=diff" >> $GITHUB_OUTPUT
+            echo "Arquivos: $FILES"
+          fi
+
+      # ── Modo: arquivo específico ──────────────────────────────────────────
+      - name: Atualizar arquivo específico
+        if: steps.changed.outputs.mode == 'single'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python docs-wiki/scripts/gemini_incrementer.py \
+            --file "${{ github.event.inputs.file }}" \
+            --output resources/docs/1.0 \
+            --project-root . \
+            --no-engine
+
+      # ── Modo: diff incremental ────────────────────────────────────────────
+      - name: Atualizar docs do diff
+        if: steps.changed.outputs.mode == 'diff' && steps.changed.outputs.files != ''
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python docs-wiki/scripts/gemini_incrementer.py \
+            --diff HEAD~1..HEAD \
+            --output resources/docs/1.0 \
+            --project-root . \
+            --no-engine
+
+      # ── Modo: rebuild total (workflow_dispatch manual) ─────────────────────
+      - name: Rebuild total da wiki
+        if: steps.changed.outputs.mode == 'all'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Pega todos os arquivos relevantes
+          find app/Http/Controllers app/Models/Tenant app/Jobs/Tenant \
+               resources/js/pages resources/js/service/tenant \
+               database/migrations \
+               -name "*.php" -o -name "*.vue" -o -name "*.js" \
+               2>/dev/null | \
+          grep -vE '(vendor/|node_modules/|\.test\.|\.spec\.)' | \
+          while read FILE; do
+            python docs-wiki/scripts/gemini_incrementer.py \
+              --file "$FILE" \
+              --output resources/docs/1.0 \
+              --project-root . \
+              --no-engine
+            sleep 4  # rate limit Gemini free tier
+          done
+
+      # ── Commit dos docs atualizados ───────────────────────────────────────
+      - name: Commitar docs gerados
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet resources/docs/; then
+            echo "ℹ️  Nenhum doc alterado."
+          else
+            CHANGED=$(git diff --name-only resources/docs/ | wc -l)
+            git add resources/docs/
+            git commit -m "[sdv3-wiki] Atualiza $CHANGED doc(s) via Gemini [skip ci]"
+            git push
+            echo "✅ $CHANGED arquivo(s) commitados."
+          fi
+
+  # ── Validação dos docs gerados ──────────────────────────────────────────────
+  validate-wiki:
+    name: Validar estrutura dos docs
+    runs-on: ubuntu-latest
+    needs: update-wiki
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Verificar frontmatter
+        run: |
+          echo "=== Docs por módulo ==="
+          for MODULE in permits shopping contrato ged imobiliario engenharia fornecedor prospeccao compartilhado; do
+            DIR="resources/docs/1.0/$MODULE"
+            COUNT=$(find "$DIR" -name "*.md" 2>/dev/null | wc -l)
+            echo "  $MODULE: $COUNT docs"
+          done
+
+          echo ""
+          echo "=== Verificando frontmatter ==="
+          MISSING=0
+          for f in $(find resources/docs -name "*.md" 2>/dev/null); do
+            if ! head -3 "$f" | grep -q "^title:"; then
+              echo "  ⚠️  Sem frontmatter: $f"
+              MISSING=$((MISSING+1))
+            fi
+          done
+          [ "$MISSING" -eq 0 ] && echo "  ✅ Todos os arquivos com frontmatter válido" || echo "  ⚠️  $MISSING arquivo(s) sem frontmatter"
